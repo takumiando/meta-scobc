@@ -8,4 +8,6 @@ IMAGE_INSTALL:append = " \
     libgpiod \
     libgpiod-tools \
     python3-gpiod \
+    stress-ng \
+    perf \
     "
