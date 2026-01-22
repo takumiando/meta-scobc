@@ -1,0 +1,10 @@
+/ {
+	gpio-restart {
+		compatible = "gpio-restart";
+		gpios = <&gpio1 28 0>;
+		active-delay = <2000>;
+		inactive-delay = <1000>;
+		wait-delay = <5000>;
+		priority = <130>; /* 1 Higher than PSCI reset */
+	};
+};
