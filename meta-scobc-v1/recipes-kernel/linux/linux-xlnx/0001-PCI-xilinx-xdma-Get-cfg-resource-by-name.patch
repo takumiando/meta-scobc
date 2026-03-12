@@ -1,0 +1,32 @@
+From 7a65ddbba46668a361a8ceb502b82bb819549bb4 Mon Sep 17 00:00:00 2001
+From: Takumi Ando <takumi@spacecubics.com>
+Date: Thu, 12 Mar 2026 10:35:55 +0900
+Subject: [PATCH] PCI: xilinx-xdma: Get cfg resource by name
+
+Use platform_get_resource_byname() to obtain the "cfg" register region
+instead of relying on the first IORESOURCE_MEM entry.
+
+This avoids depending on the reg order in the device tree and makes the
+driver compatible with DTs that provide multiple register regions.
+
+Signed-off-by: Takumi Ando <takumi@spacecubics.com>
+---
+ drivers/pci/controller/pcie-xilinx-dma-pl.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/pci/controller/pcie-xilinx-dma-pl.c b/drivers/pci/controller/pcie-xilinx-dma-pl.c
+index dd117f07fc95..5b6da9dcc69f 100644
+--- a/drivers/pci/controller/pcie-xilinx-dma-pl.c
++++ b/drivers/pci/controller/pcie-xilinx-dma-pl.c
+@@ -738,7 +738,7 @@ static int xilinx_pl_dma_pcie_parse_dt(struct pl_dma_pcie *port,
+ 	struct resource *res;
+ 	int err;
+ 
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cfg");
+ 	if (!res) {
+ 		dev_err(dev, "Missing \"reg\" property\n");
+ 		return -ENXIO;
+-- 
+2.51.2
+

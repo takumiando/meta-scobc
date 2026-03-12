@@ -6,4 +6,5 @@ SRC_URI += " \
     file://0002-mtd-spi-nor-sfdp-introduce-smpt_map_id-fixup-hook.patch \
     file://0003-mtd-spi-nor-spansion-SMPT-fixups-for-S25FS-S.patch \
     file://0004-mtd-spi-nor-spansion-Fix-warning.patch \
+    file://0001-PCI-xilinx-xdma-Get-cfg-resource-by-name.patch \
     "
