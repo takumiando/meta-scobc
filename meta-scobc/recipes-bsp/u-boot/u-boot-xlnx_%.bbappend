@@ -4,4 +4,9 @@ require u-boot-extra-cfgs.inc
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI:append = " \
     file://0001-net-phy-dp83867-Write-only-SW_RESTART-when-restartin.patch \
+    file://0001-mtd-spi-nor-Add-Avalanche-Dual-Quad-MRAM-support.patch \
+"
+
+UBOOT_EXTRA_CFGS += " \
+    avalanche-mram.cfg \
 "
