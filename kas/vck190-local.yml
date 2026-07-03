@@ -1,0 +1,11 @@
+header:
+  version: 19
+  includes:
+    - vck190.yml
+
+local_conf_header:
+  vck190-local-sdt: |
+    SDT_URI = "file:///home/takumi/Work/meta-scobc/vck190-sdt.tar.gz"
+    SDT_URI[sha256sum] = "ab65d59fd73c1ed57bf38769b2bfc70ba98159c1ce899670d18c8fa60275a687"
+    SDT_URI[S] = "${WORKDIR}/vck190-sdt"
+    PDI_PATH = "${PDI_PATH_DIR}/vck190.pdi"

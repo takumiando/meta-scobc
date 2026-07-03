@@ -47,6 +47,7 @@ build/tmp/deploy/images/<machine>/
 | SC-OBC Module V1 Space Grade     | [`versal-scobc-v1-sdt-full`][m-space]            | [`kas/scobc-v1-sdt.yml`][kas-space]         |
 | SC-OBC Module V1 Developer Grade | [`versal-scobc-v1-ve2302e-sdt-full`][m-dev-2302] | [`kas/scobc-v1-devgrade.yml`][kas-dev-2302] |
 | SC-OBC Module V1 VE2002 Variant  | [`versal-scobc-v1-ve2002e-sdt-full`][m-dev-2002] | [`kas/scobc-v1-devgrade-ve2002.yml`][kas-dev-2002] |
+| AMD VCK190 Evaluation Kit        | [`vck190`][m-vck190]                              | [`kas/vck190.yml`][kas-vck190]                     |
 
 > [!NOTE]
 > SC-OBC Module V1 VE2002 Variant is not
@@ -73,8 +74,10 @@ $ kas build kas/scobc-v1-sdt.yml
 [tag-v2026.06]: https://github.com/spacecubics/meta-scobc/tree/v2026.06
 [git-lfs]: https://git-lfs.com/
 [m-space]: meta-scobc/conf/machine/versal-scobc-v1-ve2302i-sdt-full.conf
+[m-vck190]: meta-scobc/conf/machine/vck190.conf
 [m-dev-2302]: meta-scobc/conf/machine/versal-scobc-v1-ve2302e-sdt-full.conf
 [m-dev-2002]: meta-scobc/conf/machine/versal-scobc-v1-ve2002e-sdt-full.conf
 [kas-space]: kas/scobc-v1-sdt.yml
+[kas-vck190]: kas/vck190.yml
 [kas-dev-2302]: kas/scobc-v1-devgrade.yml
 [kas-dev-2002]: kas/scobc-v1-devgrade-ve2002.yml

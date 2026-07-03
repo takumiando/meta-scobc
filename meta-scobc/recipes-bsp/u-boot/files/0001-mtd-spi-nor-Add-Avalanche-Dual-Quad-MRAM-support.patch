@@ -1,7 +1,7 @@
-From 16c440d09d427f3048b871efb1f235384f8472ec Mon Sep 17 00:00:00 2001
+From 3e4255ae15ac4b4f87b7fc94f4e051479bc1a05b Mon Sep 17 00:00:00 2001
 From: Takumi Ando <takumi@spacecubics.com>
 Date: Thu, 2 Jul 2026 19:03:21 +0900
-Subject: [PATCH] mtd: spi-nor: Add Avalanche Dual Quad MRAM support
+Subject: [PATCH 1/2] mtd: spi-nor: Add Avalanche Dual Quad MRAM support
 
 Add Avalanche Dual Quad MRAM manufacturer ID detection and configuration.
 
@@ -28,7 +28,7 @@ index 48fc09d2b33..e0e464daf53 100644
  
  config SPI_FLASH_USE_4K_SECTORS
 diff --git a/drivers/mtd/spi/spi-nor-ids.c b/drivers/mtd/spi/spi-nor-ids.c
-index d6d27bc3857..a9b08de81d9 100644
+index d6d27bc3857..21210b28b2f 100644
 --- a/drivers/mtd/spi/spi-nor-ids.c
 +++ b/drivers/mtd/spi/spi-nor-ids.c
 @@ -77,6 +77,16 @@ const struct flash_info spi_nor_ids[] = {
@@ -37,13 +37,13 @@ index d6d27bc3857..a9b08de81d9 100644
  #endif
 +#ifdef CONFIG_SPI_FLASH_AVALANCHE	/* AVALANCHE */
 +	{ INFO("as301g208", 0xe62128, 0, 64 * 1024, 1024,
-+		USE_FSR | SPI_NOR_QUAD_READ | SPI_NOR_NO_ERASE) },
++		SECT_4K | USE_FSR | SPI_NOR_QUAD_READ | NO_CHIP_ERASE) },
 +	{ INFO("as302g208", 0xe62129, 0, 64 * 1024, 2048,
-+		USE_FSR | SPI_NOR_QUAD_READ | SPI_NOR_NO_ERASE) },
++		SECT_4K | USE_FSR | SPI_NOR_QUAD_READ | NO_CHIP_ERASE) },
 +	{ INFO("as304g208", 0xe6212a, 0, 64 * 1024, 4096,
-+		USE_FSR | SPI_NOR_QUAD_READ | SPI_NOR_NO_ERASE) },
++		SECT_4K | USE_FSR | SPI_NOR_QUAD_READ | NO_CHIP_ERASE) },
 +	{ INFO("as308g208", 0xe6212c, 0, 64 * 1024, 8192,
-+		USE_FSR | SPI_NOR_QUAD_READ | SPI_NOR_NO_ERASE) },
++		SECT_4K | USE_FSR | SPI_NOR_QUAD_READ | NO_CHIP_ERASE) },
 +#endif
  #ifdef CONFIG_SPI_FLASH_EON		/* EON */
  	/* EON -- en25xxx */

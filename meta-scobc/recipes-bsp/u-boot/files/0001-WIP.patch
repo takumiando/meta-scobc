@@ -1,0 +1,41 @@
+From 0c967913c5a91ca883eaf1e188578131150dc9d3 Mon Sep 17 00:00:00 2001
+From: Takumi Ando <takumi@spacecubics.com>
+Date: Mon, 6 Jul 2026 10:48:58 +0900
+Subject: [PATCH] WIP
+
+Signed-off-by: Takumi Ando <takumi@spacecubics.com>
+---
+ drivers/mtd/spi/spi-nor-core.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/mtd/spi/spi-nor-core.c b/drivers/mtd/spi/spi-nor-core.c
+index b79a6a9b181..1af1be3ca71 100644
+--- a/drivers/mtd/spi/spi-nor-core.c
++++ b/drivers/mtd/spi/spi-nor-core.c
+@@ -6625,6 +6625,23 @@ int spi_nor_scan(struct spi_nor *nor)
+ 	puts("\n");
+ #endif
+ 
++	printf("avl: %s size=%llu page=%u addr_width=%u "
++		"read=0x%02x dummy=%u program=0x%02x erase=0x%02x "
++		"read_proto=%d write_proto=%d reg_proto=%d flags=0x%x num_flash=%u\n",
++		nor->info->name,
++		(unsigned long long)nor->mtd.size,
++		nor->page_size,
++		nor->addr_width,
++		nor->read_opcode,
++		nor->read_dummy,
++		nor->program_opcode,
++		nor->erase_opcode,
++		nor->read_proto,
++		nor->write_proto,
++		nor->reg_proto,
++		nor->flags,
++		nor->num_flash);
++
+ 	return 0;
+ }
+ 
+-- 
+2.54.0
+

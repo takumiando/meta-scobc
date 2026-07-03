@@ -1,0 +1,6 @@
+&qspi {
+	xlnx,connection-mode = <0>;
+	xlnx,qspi-mode = <0>;
+	num-cs = <1>;
+	is-dual = <0>;
+};

@@ -1,0 +1,11 @@
+header:
+  version: 19
+  includes:
+    - kas/xilinx/v2025-2.yml
+    - kas/sc/scobc.yml
+    - kas/machine/vck190.yml
+    - kas/targets/sc-image-dev.yml
+
+local_conf_header:
+  disable-spdx: |
+    INHERIT_DISTRO:remove = "create-spdx"

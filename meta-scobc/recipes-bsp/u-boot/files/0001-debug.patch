@@ -1,0 +1,143 @@
+From e48fe7471bf549949f35b8b41fbddc5b71427da3 Mon Sep 17 00:00:00 2001
+From: Takumi Ando <takumi@spacecubics.com>
+Date: Tue, 7 Jul 2026 15:49:05 +0900
+Subject: [PATCH] debug
+
+Signed-off-by: Takumi Ando <takumi@spacecubics.com>
+---
+ drivers/mtd/spi/spi-nor-core.c | 80 +++++++++++++++++++++++++++++++---
+ 1 file changed, 74 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/mtd/spi/spi-nor-core.c b/drivers/mtd/spi/spi-nor-core.c
+index 1af1be3ca71..5ad3be8c62c 100644
+--- a/drivers/mtd/spi/spi-nor-core.c
++++ b/drivers/mtd/spi/spi-nor-core.c
+@@ -31,6 +31,7 @@
+ #include <mtd/cfi_flash.h>
+ #include <spi-mem.h>
+ #include <spi.h>
++#include <env.h>
+ 
+ #include "sf_internal.h"
+ 
+@@ -380,17 +381,68 @@ static int spansion_write_any_reg(struct spi_nor *nor, u32 addr, u8 val)
+ }
+ #endif
+ 
++static void spi_nor_avalanche_set_read_mode(struct spi_nor *nor)
++{
++	unsigned long mode;
++
++	if (strncmp(nor->info->name, "as30", 4))
++		return;
++
++	/*
++	 * This test is intended for a single MRAM device.
++	 * Do not alter the dual-parallel configuration.
++	 */
++	if (nor->num_flash > 1)
++		return;
++
++	mode = env_get_ulong("avl_read_mode", 16, 0x03);
++
++	switch (mode) {
++	case 0x03:
++		nor->read_opcode = 0x03;
++		nor->read_dummy = 0;
++		nor->read_proto = SNOR_PROTO_1_1_1;
++		break;
++
++	case 0x13:
++		nor->read_opcode = 0x13;
++		nor->read_dummy = 0;
++		nor->read_proto = SNOR_PROTO_1_1_1;
++		break;
++
++	case 0x6c:
++		nor->read_opcode = 0x6c;
++		nor->read_dummy = 8;
++		nor->read_proto = SNOR_PROTO_1_1_4;
++		break;
++
++	default:
++		printf("avl: unsupported read mode 0x%lx, using 0x03\n",
++		       mode);
++
++		nor->read_opcode = 0x03;
++		nor->read_dummy = 0;
++		nor->read_proto = SNOR_PROTO_1_1_1;
++		break;
++	}
++}
++
+ static ssize_t spi_nor_read_data(struct spi_nor *nor, loff_t from, size_t len,
+ 				 u_char *buf)
+ {
+-	struct spi_mem_op op =
+-			SPI_MEM_OP(SPI_MEM_OP_CMD(nor->read_opcode, 0),
+-				   SPI_MEM_OP_ADDR(nor->addr_width, from, 0),
+-				   SPI_MEM_OP_DUMMY(nor->read_dummy, 0),
+-				   SPI_MEM_OP_DATA_IN(len, buf, 0));
++	struct spi_mem_op op;
+ 	size_t remaining = len;
++	bool no_dirmap;
+ 	int ret;
+ 
++	spi_nor_avalanche_set_read_mode(nor);
++
++	op = (struct spi_mem_op)
++		SPI_MEM_OP(SPI_MEM_OP_CMD(nor->read_opcode, 0),
++			   SPI_MEM_OP_ADDR(nor->addr_width, from, 0),
++			   SPI_MEM_OP_DUMMY(nor->read_dummy, 0),
++			   SPI_MEM_OP_DATA_IN(len, buf, 0));
++
+ 	spi_nor_setup_op(nor, &op, nor->read_proto);
+ 
+ 	/* convert the dummy cycles to the number of bytes */
+@@ -398,10 +450,23 @@ static ssize_t spi_nor_read_data(struct spi_nor *nor, loff_t from, size_t len,
+ 	if (spi_nor_protocol_is_dtr(nor->read_proto))
+ 		op.dummy.nbytes *= 2;
+ 
++	no_dirmap = env_get_ulong("avl_no_dirmap", 10, 0);
++
++	printf("avl-op: cmd=%02x cmd-bw=%u addr=%u/%u "
++		"dummy=%u/%u data-bw=%u spi-mode=0x%x rx-quad=%u "
++		"dirmap=%u\n",
++		op.cmd.opcode, op.cmd.buswidth,
++		op.addr.nbytes, op.addr.buswidth,
++		op.dummy.nbytes, op.dummy.buswidth,
++		op.data.buswidth, nor->spi->mode,
++		!!(nor->spi->mode & SPI_RX_QUAD),
++		!!nor->dirmap.rdesc);
++
+ 	while (remaining) {
+ 		op.data.nbytes = remaining < UINT_MAX ? remaining : UINT_MAX;
+ 
+-		if (CONFIG_IS_ENABLED(SPI_DIRMAP) && nor->dirmap.rdesc) {
++		if (CONFIG_IS_ENABLED(SPI_DIRMAP) &&
++		    nor->dirmap.rdesc && !no_dirmap) {
+ 			/*
+ 			 * Record current operation information which may be used
+ 			 * when the address or data length exceeds address mapping.
+@@ -411,15 +476,18 @@ static ssize_t spi_nor_read_data(struct spi_nor *nor, loff_t from, size_t len,
+ 			ret = spi_mem_dirmap_read(nor->dirmap.rdesc,
+ 						  op.addr.val, op.data.nbytes,
+ 						  op.data.buf.in);
++			printf("avl: dirmap ret=%d\n", ret);
+ 			if (ret < 0)
+ 				return ret;
+ 			op.data.nbytes = ret;
+ 		} else {
+ 			ret = spi_mem_adjust_op_size(nor->spi, &op);
++			printf("avl: adjust ret=%d\n", ret);
+ 			if (ret)
+ 				return ret;
+ 
+ 			ret = spi_mem_exec_op(nor->spi, &op);
++			printf("avl: exec ret=%d\n", ret);
+ 			if (ret)
+ 				return ret;
+ 		}
+-- 
+2.54.0
+
