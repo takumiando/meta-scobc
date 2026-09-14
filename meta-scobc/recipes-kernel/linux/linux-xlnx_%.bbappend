@@ -15,7 +15,8 @@ SRC_URI += " \
     file://0002-mtd-spi-nor-everspin-Add-EM064LXQ-support.patch \
     file://0001-rtc-zynqmp-Do-not-use-DT-calibration-value-as-RTC-fr.patch \
     file://0002-rtc-zynqmp-Always-program-Max_Tick-and-preserve-frac.patch \
-    "
+    file://0001-PCI-xilinx-xdma-Get-cfg-resource-by-name.patch \
+"
 
 SRC_URI:append = " \
     ${@'file://xilinx-wwdt.cfg' if bb.utils.to_boolean(d.getVar('ENABLE_XILINX_FPD_WWDT'), False) else ''} \
