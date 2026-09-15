@@ -30,3 +30,23 @@ DT_INCLUDE:append:linux = "${@ \
     ' ${RECIPE_SYSROOT}${datadir}/sdt/${MACHINE}/include' \
     if bb.utils.to_boolean(d.getVar('ENABLE_OPENAMP'), False) else '' \
 }"
+
+# The SDT flow keeps PL nodes in a generated Linux DT overlay instead of the
+# Linux domain DTS.  SC-OBC Module V1 loads its fixed PL image during boot, so
+# merge that hardware description into the base DT rather than requiring the
+# overlay to be applied at runtime.
+SCOBC_V1_PL_OVERLAY_DTSI = "pl-overlay-full/pl.dtsi"
+SRC_URI:append:linux = " file://${SCOBC_V1_PL_OVERLAY_DTSI}"
+
+do_configure:append:linux() {
+    if [ ! -f "${WORKDIR}/${SCOBC_V1_PL_OVERLAY_DTSI}" ]; then
+        bbfatal "Unable to find generated PL overlay: ${SCOBC_V1_PL_OVERLAY_DTSI}"
+    fi
+
+    # Keep the generated overlay fragments but drop the top-level directives
+    # so the file can be included in the base DTS.
+    sed -e '/^\/dts-v1\/;$/d' -e '/^\/plugin\/;$/d' \
+        "${WORKDIR}/${SCOBC_V1_PL_OVERLAY_DTSI}" \
+        > "${DT_FILES_PATH}/scobc-pl.dtsi"
+    echo '#include "scobc-pl.dtsi"' >> "${DT_FILES_PATH}/${BASE_DTS}.dts"
+}
