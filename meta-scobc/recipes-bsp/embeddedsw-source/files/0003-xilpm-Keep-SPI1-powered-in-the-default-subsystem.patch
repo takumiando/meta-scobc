@@ -1,0 +1,33 @@
+From 1fdb10fa872b7d9f377d4f05fb1a4a4057214075 Mon Sep 17 00:00:00 2001
+From: Takumi Ando <takumi@spacecubics.com>
+Date: Wed, 16 Sep 2026 12:00:00 +0900
+Subject: [PATCH] xilpm: Keep SPI1 powered in the default subsystem
+
+SPI1 is used by the SC-OBC Module V1 RPU after Linux starts.  It is not
+described as a Linux device, so the default subsystem must preallocate it
+to prevent PLM from powering it down during initialization finalization.
+
+Do this in the built-in default-subsystem preallocation list.  Adding a
+SPI1 requirement using a separate CDO would suppress the list's automatic
+population, because the default subsystem would then already have a
+peripheral requirement.
+
+Signed-off-by: Takumi Ando <takumi@spacecubics.com>
+---
+ .../xilpm/src/versal/server/xpm_api_plat.c       | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/lib/sw_services/xilpm/src/versal/server/xpm_api_plat.c b/lib/sw_services/xilpm/src/versal/server/xpm_api_plat.c
+index bc8db2e81115..7aa1e129918a 100644
+--- a/lib/sw_services/xilpm/src/versal/server/xpm_api_plat.c
++++ b/lib/sw_services/xilpm/src/versal/server/xpm_api_plat.c
+@@ -417,6 +417,7 @@ static XStatus XPm_AddReqsDefaultSubsystem(XPm_Subsystem *Subsystem)
+ 		{PM_DEV_PSM_PROC, (u32)PM_CAP_ACCESS},
+ 		{PM_DEV_UART_0, (u32)XPM_MAX_CAPABILITY},
+ 		{PM_DEV_UART_1, (u32)XPM_MAX_CAPABILITY},
++		{PM_DEV_SPI_1, (u32)PM_CAP_ACCESS},
+ 		{PM_DEV_OCM_0, (u32)PM_CAP_ACCESS | (u32)PM_CAP_CONTEXT},
+ 		{PM_DEV_OCM_1, (u32)PM_CAP_ACCESS | (u32)PM_CAP_CONTEXT},
+ 		{PM_DEV_OCM_2, (u32)PM_CAP_ACCESS | (u32)PM_CAP_CONTEXT},
+-- 
+2.54.0
