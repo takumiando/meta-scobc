@@ -10,8 +10,11 @@ RDEPENDS:${PN} += "plnx-initramfs-framework-base"
 
 RAMROOT_SIZE ?= "2G"
 RAMROOT_SIZE:versal-scobc-v1-ve2002e-reva-sdt-full = "2G"
+RAMROOT_SIZE:versal-scobc-v1-ve2002e-revb-sdt-full = "2G"
 RAMROOT_SIZE:versal-scobc-v1-ve2302e-reva-sdt-full = "2G"
+RAMROOT_SIZE:versal-scobc-v1-ve2302e-revb-sdt-full = "2G"
 RAMROOT_SIZE:versal-scobc-v1-ve2302i-reva-sdt-full = "2G"
+RAMROOT_SIZE:versal-scobc-v1-ve2302i-revb-sdt-full = "2G"
 
 do_install() {
     install -d ${D}/init.d
