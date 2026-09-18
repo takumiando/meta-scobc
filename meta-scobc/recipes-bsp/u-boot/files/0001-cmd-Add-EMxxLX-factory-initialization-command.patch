@@ -1,0 +1,1052 @@
+From 40cd46b09dc5442faedf3e26d7d4e3f0cdbe6122 Mon Sep 17 00:00:00 2001
+From: Takumi Ando <takumi@spacecubics.com>
+Date: Fri, 18 Sep 2026 15:22:09 +0900
+Subject: [PATCH] cmd: Add EMxxLX factory-initialization command
+
+EMxxLX devices require a destructive factory initialization after PCB
+assembly and solder reflow. Generic SPI NOR commands cannot execute the
+required initialization of status, configuration, OTP, and array
+storage.
+
+Add an explicit command that reports device state and performs the
+EST3011 sequence for EM064LXQ. Require the exact JEDEC ID, capacity,
+target bus/chip select, and ERASE-ALL confirmation before the destructive
+operation.
+
+Apply the JESD252 signal-reset sequence before probing the device. This
+returns its interface and internal control logic to a known SPI state,
+which is required before the EST3011 register writes can be accepted.
+
+Provide a non-destructive WREN test that repeatedly sets and clears the
+write-enable latch to diagnose intermittent command acceptance. Poll WEL
+up to three times at one-second intervals after each WREN, and retry the
+complete WREN sequence up to three times before failing a write.
+
+Observe the minimum chip-select-high recovery time between commands so
+that writes are accepted and completed before status polling begins.
+
+Finish with the SPI, 16-dummy-cycle, three-byte, persistent-memory
+configuration expected by the current drivers.
+
+Signed-off-by: Takumi Ando <takumi@spacecubics.com>
+---
+ cmd/Kconfig  |   9 +
+ cmd/Makefile |   1 +
+ cmd/emxxlx.c | 981 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 991 insertions(+)
+ create mode 100644 cmd/emxxlx.c
+
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index 4b33468891e..1fb7f1092cd 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1630 +1630,10 @@
++config CMD_EMXXLX
++	bool "emxxlx - Initialize Everspin EMxxLX MRAM"
++	depends on ARCH_VERSAL && DM_SPI_FLASH && SPI_MEM
++	help
++	  Provide diagnostic and destructive factory-initialization commands
++	  for Everspin EMxxLX MRAM devices. The initialization follows the
++	  Everspin EST3011 device-initialization sequence and destroys all
++	  array and OTP data.
++
+ config CMD_SPI
+diff --git a/cmd/Makefile b/cmd/Makefile
+index 533d0f6a1be..1dc89cf167a 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -164,6 +164,7 @@ obj-$(CONFIG_SANDBOX) += host.o
+ obj-$(CONFIG_CMD_SATA) += sata.o
+ obj-$(CONFIG_CMD_NVME) += nvme.o
+ obj-$(CONFIG_SANDBOX) += sb.o
++obj-$(CONFIG_CMD_EMXXLX) += emxxlx.o
+ obj-$(CONFIG_CMD_SF) += sf.o
+ obj-$(CONFIG_CMD_SCMI) += scmi.o
+ obj-$(CONFIG_CMD_SCSI) += scsi.o disk.o
+diff --git a/cmd/emxxlx.c b/cmd/emxxlx.c
+new file mode 100644
+index 00000000000..170edf94140
+--- /dev/null
++++ b/cmd/emxxlx.c
+@@ -0,0 +1,981 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Everspin EMxxLX diagnostics and factory initialization
++ *
++ * Copyright (C) 2026 Space Cubics Inc.
++ *
++ * The destructive initialization follows EST3011 Rev. 1.1, section 2.1,
++ * for devices of 64 Mbit or lower density. It is intentionally exposed as
++ * an interactive command and must never run automatically during boot.
++ */
++
++#include <asm/cache.h>
++#include <asm/io.h>
++#include <command.h>
++#include <dm.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/mtd/spi-nor.h>
++#include <linux/sizes.h>
++#include <malloc.h>
++#include <spi-mem.h>
++#include <spi_flash.h>
++#include <time.h>
++
++#define EMXXLX_ID			0x6bbb17
++#define EMXXLX_SIZE			SZ_8M
++#define EMXXLX_IO_SIZE			SZ_4K
++#define EMXXLX_OTP_DATA_SIZE		256
++#define EMXXLX_OTP_TOTAL_SIZE		257
++#define EMXXLX_NVCR_COUNT		13
++#define EMXXLX_VCR_COUNT			9
++
++#define EMXXLX_OP_WREN			0x06
++#define EMXXLX_OP_WRDI			0x04
++#define EMXXLX_OP_RDSR			0x05
++#define EMXXLX_OP_WRSR			0x01
++#define EMXXLX_OP_RDFSR			0x70
++#define EMXXLX_OP_CLFSR			0x50
++#define EMXXLX_OP_RDID			0x9f
++#define EMXXLX_OP_READ			0x03
++#define EMXXLX_OP_RDNVCR			0xb5
++#define EMXXLX_OP_WRNVCR			0xb1
++#define EMXXLX_OP_RDVCR			0x85
++#define EMXXLX_OP_WRVCR			0x81
++#define EMXXLX_OP_OTP_WRITE		0x42
++#define EMXXLX_OP_BULK_ERASE		0xc7
++#define EMXXLX_OP_RESET_ENABLE		0x66
++#define EMXXLX_OP_RESET_MEMORY		0x99
++
++#define EMXXLX_SR_WEL			BIT(1)
++#define EMXXLX_SR_WRITABLE_MASK		GENMASK(7, 2)
++
++#define EMXXLX_FSR_PROTECTION_ERR	BIT(1)
++#define EMXXLX_FSR_CRC_ERR		BIT(3)
++#define EMXXLX_FSR_PROGRAM_ERR		BIT(4)
++#define EMXXLX_FSR_ERASE_ERR		BIT(5)
++#define EMXXLX_FSR_READY			BIT(7)
++#define EMXXLX_FSR_ERROR_MASK		(EMXXLX_FSR_PROTECTION_ERR | \
++					 EMXXLX_FSR_CRC_ERR | \
++					 EMXXLX_FSR_PROGRAM_ERR | \
++					 EMXXLX_FSR_ERASE_ERR)
++
++#define EMXXLX_VCR_INT_MASK		0x0f
++#define EMXXLX_VCR_INT_STATUS		0x10
++#define EMXXLX_VCR_DFIM			0x1e
++#define EMXXLX_VCR_DFIM_ENTER		0x6b
++#define EMXXLX_VCR_DFIM_EXIT		0x00
++#define EMXXLX_VCR_ERASE_ZERO		0x7f
++#define EMXXLX_VCR_ERASE_ONE		0xff
++
++#define EMXXLX_READY_TIMEOUT_MS		1000
++#define EMXXLX_WREN_ATTEMPTS		3
++#define EMXXLX_WEL_CHECKS		3
++#define EMXXLX_WEL_CHECK_DELAY_MS	1000
++
++/* Versal PMC MIO and GPIO registers used for the JESD252 signal reset. */
++#define EMXXLX_PMC_MIO_BASE		0xf1060000UL
++#define EMXXLX_PMC_MIO_PIN(pin)		(EMXXLX_PMC_MIO_BASE + ((pin) * 4))
++#define EMXXLX_PMC_MIO_TRI		(EMXXLX_PMC_MIO_BASE + 0x200)
++#define EMXXLX_PMC_MIO_WPROT		(EMXXLX_PMC_MIO_BASE + 0x828)
++#define EMXXLX_PMC_GPIO_BASE		0xf1020000UL
++#define EMXXLX_PMC_GPIO_DATA		(EMXXLX_PMC_GPIO_BASE + 0x40)
++#define EMXXLX_PMC_GPIO_DIRM		(EMXXLX_PMC_GPIO_BASE + 0x204)
++#define EMXXLX_PMC_GPIO_OUTEN		(EMXXLX_PMC_GPIO_BASE + 0x208)
++#define EMXXLX_PMC_MIO_GPIO0		0x60
++
++#define EMXXLX_QSPI_CLK_MIO		0
++#define EMXXLX_QSPI_IO1_MIO		1
++#define EMXXLX_QSPI_IO0_MIO		4
++#define EMXXLX_QSPI_CS0_MIO		5
++#define EMXXLX_QSPI_CS1_MIO		7
++
++struct emxxlx_ctx {
++	struct spi_nor *nor;
++	u8 *buf;
++	u8 addr_nbytes;
++};
++
++struct emxxlx_signal_reset_state {
++	u32 mio_clk;
++	u32 mio_io1;
++	u32 mio_io0;
++	u32 mio_cs;
++	u32 data;
++	u32 dirm;
++	u32 outen;
++	u32 tri;
++	u32 wprot;
++};
++
++static void emxxlx_gpio_set(unsigned int pin, bool high)
++{
++	u32 value = readl(EMXXLX_PMC_GPIO_DATA);
++
++	if (high)
++		value |= BIT(pin);
++	else
++		value &= ~BIT(pin);
++	writel(value, EMXXLX_PMC_GPIO_DATA);
++}
++
++/*
++ * JESD252 reset with signal sequence. SCK remains low while IO0 presents
++ * 0, 1, 0, 1 on four consecutive rising edges of CS#.
++ */
++static int emxxlx_signal_reset(unsigned int bus, unsigned int cs)
++{
++	static const bool reset_pattern[] = { false, true, false, true };
++	struct emxxlx_signal_reset_state saved;
++	unsigned int cs_mio;
++	u32 all_mask;
++	u32 output_mask;
++	unsigned int i;
++
++	if (bus || cs > 1) {
++		puts("EMxxLX: signal reset supports only Versal GQSPI 0:0/0:1\n");
++		return -EOPNOTSUPP;
++	}
++
++	cs_mio = cs ? EMXXLX_QSPI_CS1_MIO : EMXXLX_QSPI_CS0_MIO;
++	output_mask = BIT(EMXXLX_QSPI_CLK_MIO) |
++		      BIT(EMXXLX_QSPI_IO0_MIO) | BIT(cs_mio);
++	all_mask = output_mask | BIT(EMXXLX_QSPI_IO1_MIO);
++
++	saved.mio_clk = readl(EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_CLK_MIO));
++	saved.mio_io1 = readl(EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_IO1_MIO));
++	saved.mio_io0 = readl(EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_IO0_MIO));
++	saved.mio_cs = readl(EMXXLX_PMC_MIO_PIN(cs_mio));
++	saved.data = readl(EMXXLX_PMC_GPIO_DATA);
++	saved.dirm = readl(EMXXLX_PMC_GPIO_DIRM);
++	saved.outen = readl(EMXXLX_PMC_GPIO_OUTEN);
++	saved.tri = readl(EMXXLX_PMC_MIO_TRI);
++	saved.wprot = readl(EMXXLX_PMC_MIO_WPROT);
++
++	/* Prepare inactive levels before routing the pins to GPIO. */
++	writel((saved.data & ~(BIT(EMXXLX_QSPI_CLK_MIO) |
++				 BIT(EMXXLX_QSPI_IO0_MIO))) | BIT(cs_mio),
++	       EMXXLX_PMC_GPIO_DATA);
++	writel((saved.dirm | output_mask) & ~BIT(EMXXLX_QSPI_IO1_MIO),
++	       EMXXLX_PMC_GPIO_DIRM);
++	writel((saved.outen | output_mask) & ~BIT(EMXXLX_QSPI_IO1_MIO),
++	       EMXXLX_PMC_GPIO_OUTEN);
++	writel(0, EMXXLX_PMC_MIO_WPROT);
++	writel((saved.tri & ~output_mask) | BIT(EMXXLX_QSPI_IO1_MIO),
++	       EMXXLX_PMC_MIO_TRI);
++	writel(EMXXLX_PMC_MIO_GPIO0,
++	       EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_CLK_MIO));
++	writel(EMXXLX_PMC_MIO_GPIO0,
++	       EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_IO1_MIO));
++	writel(EMXXLX_PMC_MIO_GPIO0,
++	       EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_IO0_MIO));
++	writel(EMXXLX_PMC_MIO_GPIO0, EMXXLX_PMC_MIO_PIN(cs_mio));
++	udelay(1);
++
++	for (i = 0; i < ARRAY_SIZE(reset_pattern); i++) {
++		emxxlx_gpio_set(EMXXLX_QSPI_IO0_MIO, reset_pattern[i]);
++		udelay(1);
++		emxxlx_gpio_set(cs_mio, false);
++		udelay(1);
++		emxxlx_gpio_set(cs_mio, true);
++		udelay(1);
++	}
++
++	/* Allow the 200 ns internal reset pulse to complete. */
++	udelay(1);
++
++	/* Isolate the pins while restoring their QSPI routing and GPIO state. */
++	writel(readl(EMXXLX_PMC_MIO_TRI) | all_mask, EMXXLX_PMC_MIO_TRI);
++	writel(saved.mio_clk,
++	       EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_CLK_MIO));
++	writel(saved.mio_io1,
++	       EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_IO1_MIO));
++	writel(saved.mio_io0,
++	       EMXXLX_PMC_MIO_PIN(EMXXLX_QSPI_IO0_MIO));
++	writel(saved.mio_cs, EMXXLX_PMC_MIO_PIN(cs_mio));
++	writel(saved.tri, EMXXLX_PMC_MIO_TRI);
++	writel(saved.data, EMXXLX_PMC_GPIO_DATA);
++	writel(saved.dirm, EMXXLX_PMC_GPIO_DIRM);
++	writel(saved.outen, EMXXLX_PMC_GPIO_OUTEN);
++	writel(saved.wprot, EMXXLX_PMC_MIO_WPROT);
++
++	return 0;
++}
++
++static int emxxlx_exec(struct emxxlx_ctx *ctx, u8 opcode, u8 addr_nbytes,
++		       u32 addr, u8 dummy_nbytes, enum spi_mem_data_dir dir,
++		       size_t len)
++{
++	int ret;
++	struct spi_mem_op op = {
++		.cmd = {
++			.nbytes = 1,
++			.buswidth = 1,
++			.opcode = opcode,
++		},
++		.addr = {
++			.nbytes = addr_nbytes,
++			.buswidth = 1,
++			.val = addr,
++		},
++		.dummy = {
++			.nbytes = dummy_nbytes,
++			.buswidth = 1,
++		},
++		.data = {
++			.buswidth = 1,
++			.dir = dir,
++			.nbytes = len,
++		},
++	};
++
++	if (dir == SPI_MEM_DATA_IN)
++		op.data.buf.in = ctx->buf;
++	else if (dir == SPI_MEM_DATA_OUT)
++		op.data.buf.out = ctx->buf;
++
++	ret = spi_mem_exec_op(ctx->nor->spi, &op);
++	if (!ret)
++		udelay(2);
++
++	return ret;
++}
++
++static int emxxlx_command(struct emxxlx_ctx *ctx, u8 opcode)
++{
++	return emxxlx_exec(ctx, opcode, 0, 0, 0, SPI_MEM_NO_DATA, 0);
++}
++
++static int emxxlx_read_status(struct emxxlx_ctx *ctx, u8 *status)
++{
++	int ret;
++
++	ret = emxxlx_exec(ctx, EMXXLX_OP_RDSR, 0, 0, 0,
++			  SPI_MEM_DATA_IN, 1);
++	if (!ret)
++		*status = ctx->buf[0];
++
++	return ret;
++}
++
++static int emxxlx_read_flag_status(struct emxxlx_ctx *ctx, u8 *status)
++{
++	int ret;
++
++	ret = emxxlx_exec(ctx, EMXXLX_OP_RDFSR, 0, 0, 0,
++			  SPI_MEM_DATA_IN, 1);
++	if (!ret)
++		*status = ctx->buf[0];
++
++	return ret;
++}
++
++static int emxxlx_write_enable(struct emxxlx_ctx *ctx)
++{
++	u8 status = 0;
++	unsigned int attempt;
++	unsigned int check;
++	int last_ret = 0;
++	int ret;
++
++	for (attempt = 0; attempt < EMXXLX_WREN_ATTEMPTS; attempt++) {
++		ret = emxxlx_command(ctx, EMXXLX_OP_WREN);
++		if (ret) {
++			last_ret = ret;
++			continue;
++		}
++
++		for (check = 0; check < EMXXLX_WEL_CHECKS; check++) {
++			ret = emxxlx_read_status(ctx, &status);
++			if (ret) {
++				last_ret = ret;
++			} else {
++				last_ret = 0;
++				if (status & EMXXLX_SR_WEL) {
++					if (attempt || check)
++						printf("EMxxLX: WREN succeeded on attempt %u, check %u\n",
++						       attempt + 1, check + 1);
++					return 0;
++				}
++			}
++
++			if (check + 1 < EMXXLX_WEL_CHECKS)
++				mdelay(EMXXLX_WEL_CHECK_DELAY_MS);
++		}
++	}
++
++	if (last_ret) {
++		printf("EMxxLX: WREN failed after %u attempts (%d)\n",
++		       EMXXLX_WREN_ATTEMPTS, last_ret);
++		return last_ret;
++	}
++
++	printf("EMxxLX: WEL stayed clear after %u WREN attempts\n",
++	       EMXXLX_WREN_ATTEMPTS);
++	printf("EMxxLX: checked %u times per attempt\n", EMXXLX_WEL_CHECKS);
++	printf("EMxxLX: SR=0x%02x\n", status);
++	return -EACCES;
++}
++
++static int emxxlx_wren_test(struct emxxlx_ctx *ctx,
++			    unsigned long iterations)
++{
++	unsigned long passed = 0;
++	unsigned long failed = 0;
++	unsigned long i;
++	u8 status;
++	int ret;
++
++	for (i = 0; i < iterations; i++) {
++		ret = emxxlx_command(ctx, EMXXLX_OP_WREN);
++		if (ret)
++			return ret;
++
++		ret = emxxlx_read_status(ctx, &status);
++		if (ret)
++			return ret;
++		if (status & EMXXLX_SR_WEL)
++			passed++;
++		else
++			failed++;
++
++		ret = emxxlx_command(ctx, EMXXLX_OP_WRDI);
++		if (ret)
++			return ret;
++
++		ret = emxxlx_read_status(ctx, &status);
++		if (ret)
++			return ret;
++		if (status & EMXXLX_SR_WEL) {
++			printf("EMxxLX: WRDI did not clear WEL at iteration %lu\n",
++			       i + 1);
++			printf("EMxxLX: SR=0x%02x\n", status);
++			return -EIO;
++		}
++	}
++
++	printf("WREN test iterations : %lu\n", iterations);
++	printf("WEL set              : %lu\n", passed);
++	printf("WEL not set          : %lu\n", failed);
++
++	return failed ? -EIO : 0;
++}
++
++static int emxxlx_wait_ready(struct emxxlx_ctx *ctx, const char *operation)
++{
++	ulong start = get_timer(0);
++	u8 fsr;
++	int ret;
++
++	do {
++		ret = emxxlx_read_flag_status(ctx, &fsr);
++		if (ret)
++			return ret;
++		if (fsr & EMXXLX_FSR_READY)
++			break;
++		udelay(10);
++	} while (get_timer(start) < EMXXLX_READY_TIMEOUT_MS);
++
++	if (!(fsr & EMXXLX_FSR_READY)) {
++		printf("EMxxLX: %s timed out (FSR=0x%02x)\n", operation,
++		       fsr);
++		return -ETIMEDOUT;
++	}
++
++	if (fsr & EMXXLX_FSR_ERROR_MASK) {
++		printf("EMxxLX: %s failed (FSR=0x%02x)\n", operation, fsr);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int emxxlx_prepare_write(struct emxxlx_ctx *ctx)
++{
++	int ret;
++
++	ret = emxxlx_command(ctx, EMXXLX_OP_CLFSR);
++	if (ret)
++		return ret;
++
++	return emxxlx_write_enable(ctx);
++}
++
++static int emxxlx_write_data(struct emxxlx_ctx *ctx, u8 opcode,
++			     u32 addr, const u8 *data, size_t len,
++			     const char *operation)
++{
++	int ret;
++
++	if (len > EMXXLX_IO_SIZE)
++		return -E2BIG;
++
++	ret = emxxlx_prepare_write(ctx);
++	if (ret)
++		return ret;
++
++	memcpy(ctx->buf, data, len);
++	ret = emxxlx_exec(ctx, opcode,
++			  opcode == EMXXLX_OP_WRSR ? 0 : ctx->addr_nbytes,
++			  addr, 0, SPI_MEM_DATA_OUT, len);
++	if (ret)
++		return ret;
++
++	return emxxlx_wait_ready(ctx, operation);
++}
++
++static int emxxlx_write_status(struct emxxlx_ctx *ctx, u8 value)
++{
++	u8 status;
++	int ret;
++
++	ret = emxxlx_write_data(ctx, EMXXLX_OP_WRSR, 0, &value, 1,
++				"status-register write");
++	if (ret)
++		return ret;
++
++	ret = emxxlx_read_status(ctx, &status);
++	if (ret)
++		return ret;
++
++	if ((status & EMXXLX_SR_WRITABLE_MASK) !=
++	    (value & EMXXLX_SR_WRITABLE_MASK)) {
++		printf("EMxxLX: status verify failed: wrote 0x%02x, read 0x%02x\n",
++		       value, status);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int emxxlx_read_config(struct emxxlx_ctx *ctx, u8 opcode,
++			      u32 addr, u8 *data, size_t len)
++{
++	int ret;
++
++	ret = emxxlx_exec(ctx, opcode, ctx->addr_nbytes, addr, 0,
++			  SPI_MEM_DATA_IN, len);
++	if (!ret)
++		memcpy(data, ctx->buf, len);
++
++	return ret;
++}
++
++static int emxxlx_write_config(struct emxxlx_ctx *ctx, u8 opcode,
++			       u32 addr, const u8 *data, size_t len,
++			       const char *operation)
++{
++	return emxxlx_write_data(ctx, opcode, addr, data, len, operation);
++}
++
++static int emxxlx_verify_config(struct emxxlx_ctx *ctx, u8 opcode,
++				u32 addr, const u8 *expected, size_t len,
++				const char *name)
++{
++	int ret;
++
++	ret = emxxlx_exec(ctx, opcode, ctx->addr_nbytes, addr, 0,
++			  SPI_MEM_DATA_IN, len);
++	if (ret)
++		return ret;
++
++	if (memcmp(ctx->buf, expected, len)) {
++		printf("EMxxLX: %s verify failed\n", name);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int emxxlx_read_id(struct emxxlx_ctx *ctx, u32 *id)
++{
++	int ret;
++
++	ret = emxxlx_exec(ctx, EMXXLX_OP_RDID, 0, 0, 0,
++			  SPI_MEM_DATA_IN, 3);
++	if (!ret)
++		*id = (ctx->buf[0] << 16) | (ctx->buf[1] << 8) | ctx->buf[2];
++
++	return ret;
++}
++
++static int emxxlx_validate(struct emxxlx_ctx *ctx)
++{
++	u8 fsr;
++	u32 id;
++	int ret;
++
++	ret = emxxlx_read_id(ctx, &id);
++	if (ret)
++		return ret;
++
++	if (id != EMXXLX_ID) {
++		printf("EMxxLX: unexpected JEDEC ID %06x (expected %06x)\n",
++		       id, EMXXLX_ID);
++		return -ENODEV;
++	}
++
++	if (ctx->nor->size != EMXXLX_SIZE) {
++		printf("EMxxLX: unexpected size 0x%x (expected 0x%x)\n",
++		       ctx->nor->size, EMXXLX_SIZE);
++		return -ENODEV;
++	}
++
++	ret = emxxlx_read_flag_status(ctx, &fsr);
++	if (ret)
++		return ret;
++	ctx->addr_nbytes = fsr & BIT(0) ? 4 : 3;
++
++	return 0;
++}
++
++static void emxxlx_print_bytes(const char *name, const u8 *data, size_t len)
++{
++	size_t i;
++
++	printf("%-6s:", name);
++	for (i = 0; i < len; i++)
++		printf(" %02x", data[i]);
++	putc('\n');
++}
++
++static int emxxlx_info(struct emxxlx_ctx *ctx)
++{
++	u8 nvcr[EMXXLX_NVCR_COUNT];
++	u8 vcr[EMXXLX_VCR_COUNT];
++	u8 int_status;
++	u8 dfim;
++	u8 sr;
++	u8 fsr;
++	u32 id;
++	int ret;
++
++	ret = emxxlx_read_id(ctx, &id);
++	if (ret)
++		return ret;
++	ret = emxxlx_read_status(ctx, &sr);
++	if (ret)
++		return ret;
++	ret = emxxlx_read_flag_status(ctx, &fsr);
++	if (ret)
++		return ret;
++	ret = emxxlx_read_config(ctx, EMXXLX_OP_RDNVCR, 0, nvcr,
++				 EMXXLX_NVCR_COUNT);
++	if (ret)
++		return ret;
++	ret = emxxlx_read_config(ctx, EMXXLX_OP_RDVCR, 0, vcr,
++				 EMXXLX_VCR_COUNT);
++	if (ret)
++		return ret;
++	ret = emxxlx_read_config(ctx, EMXXLX_OP_RDVCR,
++				 EMXXLX_VCR_INT_STATUS, &int_status, 1);
++	if (ret)
++		return ret;
++	ret = emxxlx_read_config(ctx, EMXXLX_OP_RDVCR, EMXXLX_VCR_DFIM,
++				 &dfim, 1);
++	if (ret)
++		return ret;
++
++	printf("JEDEC : %06x\n", id);
++	printf("SR    : %02x\n", sr);
++	printf("FSR   : %02x\n", fsr);
++	emxxlx_print_bytes("NVCR", nvcr, sizeof(nvcr));
++	emxxlx_print_bytes("VCR", vcr, sizeof(vcr));
++	printf("ISR   : %02x (Power-On Error: %s)\n", int_status,
++	       int_status & BIT(2) ? "set" : "clear");
++	printf("DFIM  : %02x (%s)\n", dfim,
++	       dfim == 1 ? "enabled" : "disabled");
++
++	return 0;
++}
++
++static int emxxlx_set_initial_vcr(struct emxxlx_ctx *ctx)
++{
++	/* EST3011 section 2.1, step 3.1: SPI mode and four dummy cycles. */
++	static const u8 initial_vcr[EMXXLX_VCR_COUNT] = {
++		0xff, 0x04, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++	};
++	u8 int_mask = 0;
++	static const u8 int_clear = 0x07;
++	int ret;
++
++	ret = emxxlx_write_config(ctx, EMXXLX_OP_WRVCR, 0, initial_vcr,
++				  sizeof(initial_vcr), "initial VCR write");
++	if (ret)
++		return ret;
++	/* VCR5 in the block above selects three-byte addressing. */
++	ctx->addr_nbytes = 3;
++	ret = emxxlx_write_config(ctx, EMXXLX_OP_WRVCR,
++				  EMXXLX_VCR_INT_MASK, &int_mask, 1,
++				  "interrupt-mask write");
++	if (ret)
++		return ret;
++
++	return emxxlx_write_config(ctx, EMXXLX_OP_WRVCR,
++				   EMXXLX_VCR_INT_STATUS, &int_clear, 1,
++				   "interrupt-status clear");
++}
++
++static int emxxlx_set_dfim(struct emxxlx_ctx *ctx, bool enable)
++{
++	u8 value = enable ? EMXXLX_VCR_DFIM_ENTER : EMXXLX_VCR_DFIM_EXIT;
++	u8 state;
++	int ret;
++
++	ret = emxxlx_write_config(ctx, EMXXLX_OP_WRVCR, EMXXLX_VCR_DFIM,
++				  &value, 1,
++				  enable ? "DFIM entry" : "DFIM exit");
++	if (ret)
++		return ret;
++
++	ret = emxxlx_read_config(ctx, EMXXLX_OP_RDVCR, EMXXLX_VCR_DFIM,
++				 &state, 1);
++	if (ret)
++		return ret;
++
++	if (state != (enable ? 1 : 0)) {
++		printf("EMxxLX: failed to %s DFIM (state 0x%02x)\n",
++		       enable ? "enter" : "exit", state);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int emxxlx_initialize_status(struct emxxlx_ctx *ctx)
++{
++	static const u8 values[] = { 0xff, 0x00, 0xff, 0x00 };
++	size_t i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(values); i++) {
++		ret = emxxlx_write_status(ctx, values[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int emxxlx_initialize_nvcr(struct emxxlx_ctx *ctx)
++{
++	u8 expected[EMXXLX_NVCR_COUNT];
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < 4; i++) {
++		memset(expected, i & 1 ? 0xff : 0x00, sizeof(expected));
++		ret = emxxlx_write_config(ctx, EMXXLX_OP_WRNVCR, 0, expected,
++					  sizeof(expected), "NVCR initialization");
++		if (ret)
++			return ret;
++		ret = emxxlx_verify_config(ctx, EMXXLX_OP_RDNVCR, 0,
++					   expected, sizeof(expected), "NVCR");
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int emxxlx_initialize_otp(struct emxxlx_ctx *ctx)
++{
++	static const u8 otp_unlock = 0xf9;
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < 4; i++) {
++		bool write_one = !(i & 1);
++		size_t len = write_one ? EMXXLX_OTP_TOTAL_SIZE :
++					 EMXXLX_OTP_DATA_SIZE;
++
++		ret = emxxlx_write_config(ctx, EMXXLX_OP_WRVCR, 8,
++					  &otp_unlock, 1, "OTP unlock");
++		if (ret)
++			return ret;
++
++		ret = emxxlx_prepare_write(ctx);
++		if (ret)
++			return ret;
++		memset(ctx->buf, write_one ? 0xff : 0x00, len);
++		ret = emxxlx_exec(ctx, EMXXLX_OP_OTP_WRITE,
++				  ctx->addr_nbytes, 0, 0,
++				  SPI_MEM_DATA_OUT, len);
++		if (ret)
++			return ret;
++		ret = emxxlx_wait_ready(ctx, "OTP initialization");
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int emxxlx_bulk_erase(struct emxxlx_ctx *ctx, bool erase_to_one)
++{
++	u8 value = erase_to_one ? EMXXLX_VCR_ERASE_ONE :
++				    EMXXLX_VCR_ERASE_ZERO;
++	int ret;
++
++	ret = emxxlx_write_config(ctx, EMXXLX_OP_WRVCR, 8, &value, 1,
++				  "erase-value write");
++	if (ret)
++		return ret;
++
++	ret = emxxlx_prepare_write(ctx);
++	if (ret)
++		return ret;
++	ret = emxxlx_command(ctx, EMXXLX_OP_BULK_ERASE);
++	if (ret)
++		return ret;
++
++	return emxxlx_wait_ready(ctx, erase_to_one ? "erase-to-one" :
++						     "erase-to-zero");
++}
++
++static int emxxlx_verify_array(struct emxxlx_ctx *ctx, u8 expected)
++{
++	u32 offset = 0;
++	int ret;
++
++	while (offset < EMXXLX_SIZE) {
++		size_t i;
++
++		ret = emxxlx_exec(ctx, EMXXLX_OP_READ, ctx->addr_nbytes,
++				  offset, 0,
++				  SPI_MEM_DATA_IN, EMXXLX_IO_SIZE);
++		if (ret)
++			return ret;
++
++		for (i = 0; i < EMXXLX_IO_SIZE; i++) {
++			if (ctx->buf[i] != expected) {
++				printf("EMxxLX: array verify failed at 0x%08x\n",
++				       offset + (u32)i);
++				printf("EMxxLX: expected 0x%02x, read 0x%02x\n",
++				       expected, ctx->buf[i]);
++				return -EIO;
++			}
++		}
++		offset += EMXXLX_IO_SIZE;
++	}
++
++	return 0;
++}
++
++static int emxxlx_write_final_config(struct emxxlx_ctx *ctx)
++{
++	/* Match the U-Boot/Linux setup: SPI, 16 dummy cycles and 3-byte mode. */
++	static const u8 final_nvcr[EMXXLX_NVCR_COUNT] = {
++		0xff, 0x10, 0xff, 0xff, 0xff, 0xff, 0xff,
++		0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++	};
++	int ret;
++
++	ret = emxxlx_write_config(ctx, EMXXLX_OP_WRNVCR, 0, final_nvcr,
++				  sizeof(final_nvcr), "final NVCR write");
++	if (ret)
++		return ret;
++	ret = emxxlx_verify_config(ctx, EMXXLX_OP_RDNVCR, 0, final_nvcr,
++				   sizeof(final_nvcr), "final NVCR");
++	if (ret)
++		return ret;
++
++	ret = emxxlx_command(ctx, EMXXLX_OP_RESET_ENABLE);
++	if (ret)
++		return ret;
++	udelay(1);
++	ret = emxxlx_command(ctx, EMXXLX_OP_RESET_MEMORY);
++	if (ret)
++		return ret;
++	udelay(200);
++
++	return emxxlx_wait_ready(ctx, "software reset");
++}
++
++static int emxxlx_dfim(struct emxxlx_ctx *ctx)
++{
++	bool entered_dfim = false;
++	int ret;
++
++	puts("Starting EM064LXQ factory initialization...\n");
++	ret = emxxlx_info(ctx);
++	if (ret)
++		return ret;
++
++	puts("[1/8] Setting a known volatile configuration\n");
++	ret = emxxlx_set_initial_vcr(ctx);
++	if (ret)
++		goto out;
++
++	puts("[2/8] Entering DFIM\n");
++	entered_dfim = true;
++	ret = emxxlx_set_dfim(ctx, true);
++	if (ret)
++		goto out;
++
++	puts("[3/8] Initializing the status register\n");
++	ret = emxxlx_initialize_status(ctx);
++	if (ret)
++		goto out;
++
++	puts("[4/8] Initializing nonvolatile configuration registers\n");
++	ret = emxxlx_initialize_nvcr(ctx);
++	if (ret)
++		goto out;
++
++	puts("[5/8] Initializing OTP data and control byte\n");
++	ret = emxxlx_initialize_otp(ctx);
++	if (ret)
++		goto out;
++
++	puts("[6/8] Initializing the array to 0, 1, 0 and 1\n");
++	ret = emxxlx_bulk_erase(ctx, false);
++	if (ret)
++		goto out;
++	ret = emxxlx_bulk_erase(ctx, true);
++	if (ret)
++		goto out;
++	ret = emxxlx_bulk_erase(ctx, false);
++	if (ret)
++		goto out;
++	ret = emxxlx_verify_array(ctx, 0x00);
++	if (ret)
++		goto out;
++	ret = emxxlx_bulk_erase(ctx, true);
++	if (ret)
++		goto out;
++	ret = emxxlx_verify_array(ctx, 0xff);
++	if (ret)
++		goto out;
++
++	puts("[7/8] Exiting DFIM\n");
++	ret = emxxlx_set_dfim(ctx, false);
++	if (ret)
++		goto out;
++	entered_dfim = false;
++
++	puts("[8/8] Writing the operational configuration\n");
++	ret = emxxlx_write_final_config(ctx);
++	if (ret)
++		goto out;
++	ret = emxxlx_info(ctx);
++	if (ret)
++		goto out;
++
++	puts("EM064LXQ factory initialization completed successfully.\n");
++	return 0;
++
++out:
++	printf("EMxxLX: factory initialization failed: %d\n", ret);
++	if (entered_dfim) {
++		puts("EMxxLX: attempting to exit DFIM after the failure\n");
++		if (emxxlx_set_dfim(ctx, false))
++			puts("EMxxLX: WARNING: could not exit DFIM\n");
++	}
++
++	return ret;
++}
++
++static int emxxlx_parse_bus_cs(const char *arg, unsigned int *bus,
++			       unsigned int *cs)
++{
++	char *end;
++
++	*bus = simple_strtoul(arg, &end, 0);
++	if (end == arg || *end != ':')
++		return -EINVAL;
++	*cs = simple_strtoul(end + 1, &end, 0);
++	if (*end)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int do_emxxlx(struct cmd_tbl *cmdtp, int flag, int argc,
++		     char *const argv[])
++{
++	struct emxxlx_ctx ctx = { 0 };
++	struct udevice *dev;
++	unsigned long iterations = 0;
++	unsigned int bus;
++	unsigned int cs;
++	char *end;
++	int ret;
++
++	if (argc < 3)
++		return CMD_RET_USAGE;
++	ret = emxxlx_parse_bus_cs(argv[2], &bus, &cs);
++	if (ret)
++		return CMD_RET_USAGE;
++
++	if (!strcmp(argv[1], "dfim")) {
++		if (argc != 4 || strcmp(argv[3], "ERASE-ALL"))
++			return CMD_RET_USAGE;
++		puts("WARNING: DFIM destroys the entire MRAM array and OTP data.\n");
++		puts("Applying the JESD252 signal reset...\n");
++		ret = emxxlx_signal_reset(bus, cs);
++		if (ret)
++			return CMD_RET_FAILURE;
++	} else if (!strcmp(argv[1], "wren-test")) {
++		if (argc != 4)
++			return CMD_RET_USAGE;
++		iterations = simple_strtoul(argv[3], &end, 0);
++		if (*end || !iterations || iterations > 1000000)
++			return CMD_RET_USAGE;
++		puts("Applying the JESD252 signal reset...\n");
++		ret = emxxlx_signal_reset(bus, cs);
++		if (ret)
++			return CMD_RET_FAILURE;
++	} else if (strcmp(argv[1], "info") || argc != 3) {
++		return CMD_RET_USAGE;
++	}
++
++	ret = spi_flash_probe_bus_cs(bus, cs, &dev);
++	if (ret) {
++		printf("EMxxLX: failed to probe SPI flash at %u:%u: %d\n",
++		       bus, cs, ret);
++		puts("EMxxLX: the device must respond in 1S-1S-1S mode.\n");
++		puts("EMxxLX: apply a JESD252 signal reset if necessary.\n");
++		goto out;
++	}
++
++	ctx.nor = dev_get_uclass_priv(dev);
++	ctx.addr_nbytes = 3;
++	ctx.buf = memalign(ARCH_DMA_MINALIGN, EMXXLX_IO_SIZE);
++	if (!ctx.buf) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = emxxlx_validate(&ctx);
++	if (!ret) {
++		if (!strcmp(argv[1], "info"))
++			ret = emxxlx_info(&ctx);
++		else if (!strcmp(argv[1], "wren-test"))
++			ret = emxxlx_wren_test(&ctx, iterations);
++		else
++			ret = emxxlx_dfim(&ctx);
++	}
++
++out:
++	if (ctx.buf)
++		free(ctx.buf);
++
++	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_LONGHELP(emxxlx,
++	"info <bus>:<cs>\n"
++	"    - display EM064LXQ status and configuration registers\n"
++	"emxxlx wren-test <bus>:<cs> <iterations>\n"
++	"    - repeatedly set and clear WEL without modifying memory\n"
++	"emxxlx dfim <bus>:<cs> ERASE-ALL\n"
++	"    - perform the destructive EST3011 factory initialization");
++
++U_BOOT_CMD(
++	emxxlx, 4, 0, do_emxxlx,
++	"inspect and factory-initialize Everspin EMxxLX MRAM",
++	emxxlx_help_text
++);
