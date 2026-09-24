@@ -1,5 +1,5 @@
 args:
-  - --hw-description /home/takumi/Work/meta-scobc/versal-scobc-v1-devgrade-sdt-ssd1.tar.gz
+  - --hw-description /home/takumi/Work/meta-scobc/versal-scobc-v1-devgrade-sdt-ssd2.tar.gz
   - --machine-name versal-scobc-v1-ve2302e-revb-sdt-full
   - --require-machine scobc-v1-generic
   - -c meta-scobc/conf

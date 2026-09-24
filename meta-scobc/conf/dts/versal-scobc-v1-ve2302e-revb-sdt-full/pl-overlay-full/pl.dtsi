@@ -1,7 +1,7 @@
 /dts-v1/;
 /plugin/;
 &fpga {
-	firmware-name = "sc_obc_v1_versal_ve2302e_4c11dbdd.pdi";
+	firmware-name = "sc_obc_v1_versal_ve2302e_4c11dbdd+.pdi";
 	misc_clk_0: misc_clk_0 {
 		compatible = "fixed-clock";
 		clock-frequency = <125000000>;

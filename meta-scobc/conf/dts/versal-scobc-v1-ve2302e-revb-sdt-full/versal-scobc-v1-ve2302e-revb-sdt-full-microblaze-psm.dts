@@ -2638,7 +2638,7 @@
                 compatible = "simple-bus";
                 #address-cells = <0x2>;
                 #size-cells = <0x2>;
-                firmware-name = "sc_obc_v1_versal_ve2302e_4c11dbdd.pdi";
+                firmware-name = "sc_obc_v1_versal_ve2302e_4c11dbdd+.pdi";
 
                 misc_clk_0: misc_clk_0 {
                         phandle = <0xa6>;
