@@ -1,0 +1,18 @@
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	emmc_vcc: regulator-emmc-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "emmc-vcc";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpio1 51 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+};
+
+&sdhci1 {
+	vmmc-supply = <&emmc_vcc>;
+};
